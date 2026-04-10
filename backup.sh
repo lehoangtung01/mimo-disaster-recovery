@@ -9,6 +9,8 @@ DRIVE_PREFIX=${DRIVE_PREFIX:-mimo-backups/prod}
 HOSTNAME=${HOSTNAME:-$(hostname -s)}
 TS=${TS:-$(date -u +%Y%m%dT%H%M%SZ)}
 WORKDIR=${WORKDIR:-/home/hoangtung/Documents/mimo-backup-work}
+SUDO_USER_HOME=${SUDO_USER_HOME:-$(getent passwd "${SUDO_USER:-$USER}" | cut -d: -f6)}
+
 OUTDIR=${OUTDIR:-/home/hoangtung/Documents/mimo-backup-out}
 
 BUNDLE_NAME="mimo-system-bundle-${HOSTNAME}-${TS}.tar.zst"
@@ -19,8 +21,22 @@ log(){ echo "[backup] $*"; }
 
 require_cmd(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing command: $1" >&2; exit 1; }; }
 
+ensure_root_rclone_conf(){
+  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    return
+  fi
+  if [ -f /root/.config/rclone/rclone.conf ]; then
+    return
+  fi
+  if [ -f "$SUDO_USER_HOME/.config/rclone/rclone.conf" ]; then
+    mkdir -p /root/.config/rclone
+    cp -f "$SUDO_USER_HOME/.config/rclone/rclone.conf" /root/.config/rclone/rclone.conf
+  fi
+}
+
 main(){
   require_cmd rclone
+  ensure_root_rclone_conf
   require_cmd zstd
   require_cmd tar
   require_cmd psql
