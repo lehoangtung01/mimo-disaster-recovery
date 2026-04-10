@@ -17,7 +17,7 @@ apt_install(){
 }
 
 ensure_base(){
-  apt_install ca-certificates curl git jq zstd gnupg lsb-release
+  apt_install ca-certificates curl git jq zstd gnupg lsb-release rsync
 }
 
 ensure_user(){
@@ -103,30 +103,29 @@ restore_openclaw(){
 }
 
 restore_chatbot(){
-  # Requires repo url inside secrets. We store it as plain text file.
-  local repo_file="$WORKDIR/secrets/chatbot/repo_url.txt"
-  if [ ! -f "$repo_file" ]; then
+  local src="$WORKDIR/bundle/config/chatbot/chatbot-hub-refactor-src"
+  local envf="$WORKDIR/bundle/config/chatbot/chatbot-hub-refactor.env"
+  local dir="$TARGET_HOME/Documents/chatbot-hub-refactor"
+
+  if [ -d "$src" ]; then
+    log "Restoring chatbot source from bundle"
+    install -d -m 755 "$TARGET_HOME/Documents"
+    rsync -a --delete "$src/" "$dir/"
+    chown -R "$TARGET_USER:$TARGET_USER" "$dir"
+  else
+    log "Chatbot source not found in bundle; skipping"
     return
   fi
-  local repo
-  repo=$(cat "$repo_file")
-  log "Restoring chatbot repo: $repo"
-  install -d -m 755 "$TARGET_HOME/Documents"
-  chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/Documents"
-  local dir="$TARGET_HOME/Documents/chatbot-hub-refactor"
-  if [ ! -d "$dir/.git" ]; then
-    sudo -u "$TARGET_USER" git clone "$repo" "$dir"
-  else
-    sudo -u "$TARGET_USER" git -C "$dir" pull --ff-only || true
+
+  if [ -f "$envf" ]; then
+    cp -f "$envf" "$dir/.env" || true
+    chown "$TARGET_USER:$TARGET_USER" "$dir/.env" || true
   fi
 
-  if [ -f "$WORKDIR/secrets/chatbot/chatbot-hub-refactor.env" ]; then
-    cp -f "$WORKDIR/secrets/chatbot/chatbot-hub-refactor.env" "$dir/.env"
-    chown "$TARGET_USER:$TARGET_USER" "$dir/.env"
+  if [ -f "$dir/package.json" ]; then
+    log "Installing node deps (npm ci)"
+    sudo -u "$TARGET_USER" bash -lc "cd '$dir' && npm ci" || true
   fi
-
-  log "Installing node deps"
-  sudo -u "$TARGET_USER" bash -lc "cd '$dir' && npm ci"
 
   log "Creating systemd user unit"
   local unit="/home/${TARGET_USER}/.config/systemd/user/chatbot-hub-refactor.service"
@@ -151,7 +150,7 @@ UNIT
 
   log "Starting chatbot service"
   sudo -u "$TARGET_USER" systemctl --user daemon-reload
-  sudo -u "$TARGET_USER" systemctl --user enable --now chatbot-hub-refactor.service
+  sudo -u "$TARGET_USER" systemctl --user enable --now chatbot-hub-refactor.service || true
 }
 
 healthcheck(){
