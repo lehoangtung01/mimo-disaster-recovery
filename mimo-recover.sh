@@ -1,24 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Mimo Disaster Recovery - one-command bootstrap+restore
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/lehoangtung01/mimo-disaster-recovery/main/mimo-recover.sh | sudo bash
-#
-# Requires: Ubuntu + internet + sudo.
+# One-command bootstrap + restore.
+# curl -fsSL https://raw.githubusercontent.com/lehoangtung01/mimo-disaster-recovery/main/mimo-recover.sh | sudo bash
 
 DRIVE_REMOTE=${DRIVE_REMOTE:-drive}
 DRIVE_PREFIX=${DRIVE_PREFIX:-mimo-backups/prod}
 WORKDIR=${WORKDIR:-/opt/mimo-recovery}
 
 log(){ echo "[recovery] $*"; }
-
-need_root(){
-  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-    echo "Please run as root (sudo)." >&2
-    exit 1
-  fi
-}
+need_root(){ [ "${EUID:-$(id -u)}" -eq 0 ] || { echo "Run with sudo" >&2; exit 1; }; }
 
 apt_install(){
   export DEBIAN_FRONTEND=noninteractive
@@ -26,33 +17,43 @@ apt_install(){
   apt-get install -y --no-install-recommends "$@"
 }
 
-ensure_base(){
-  log "Installing base dependencies..."
-  apt_install ca-certificates curl git jq zstd gnupg
-}
+ensure_base(){ apt_install ca-certificates curl git jq zstd gnupg lsb-release; }
+ensure_docker(){ command -v docker >/dev/null 2>&1 || apt_install docker.io docker-compose-plugin; systemctl enable --now docker || true; }
+ensure_rclone(){ command -v rclone >/dev/null 2>&1 || apt_install rclone; }
+ensure_postgres_tools(){ apt_install postgresql-client; }
 
-ensure_docker(){
-  if command -v docker >/dev/null 2>&1; then
-    log "Docker already installed."
-    return
+fetch_drive(){ rclone copyto "${DRIVE_REMOTE}:$1" "$2" --progress --transfers 4; }
+
+restore_postgres(){
+  local dump="$1"
+  if ! id postgres >/dev/null 2>&1; then
+    log "Installing Postgres server..."
+    apt_install postgresql
   fi
-  log "Installing Docker (docker.io + compose plugin)..."
-  apt_install docker.io docker-compose-plugin
-  systemctl enable --now docker || true
+  systemctl enable --now postgresql || true
+  log "Restoring Postgres from dump..."
+  sudo -u postgres dropdb --if-exists chatbot_hub || true
+  sudo -u postgres createdb chatbot_hub || true
+  sudo -u postgres pg_restore -d chatbot_hub --clean --if-exists "$dump"
 }
 
-ensure_rclone(){
-  if command -v rclone >/dev/null 2>&1; then
-    log "rclone already installed."
-    return
+restore_qdrant(){
+  local snapdir="$1"
+  # If qdrant not present, run it via docker
+  if ! curl -fsSL http://127.0.0.1:6333/collections >/dev/null 2>&1; then
+    log "Starting Qdrant via docker..."
+    mkdir -p /var/lib/qdrant
+    docker run -d --name qdrant -p 6333:6333 -v /var/lib/qdrant:/qdrant/storage qdrant/qdrant:v1.17.0 || true
+    sleep 2
   fi
-  log "Installing rclone..."
-  apt_install rclone
-}
-
-fetch_from_drive(){
-  local src="$1" dst="$2"
-  rclone copyto "${DRIVE_REMOTE}:${src}" "${dst}" --progress --transfers 4
+  log "Restoring Qdrant snapshots..."
+  for f in "$snapdir"/*.snapshot; do
+    [ -f "$f" ] || continue
+    base=$(basename "$f")
+    col=${base%%__*}
+    log "- upload snapshot for $col"
+    curl -fsSL -X POST "http://127.0.0.1:6333/collections/${col}/snapshots/upload" -F "snapshot=@${f}" >/dev/null || true
+  done
 }
 
 main(){
@@ -60,55 +61,47 @@ main(){
   ensure_base
   ensure_docker
   ensure_rclone
+  ensure_postgres_tools
 
   mkdir -p "$WORKDIR"
   cd "$WORKDIR"
 
-  log "Fetching latest pointer from Drive..."
-  fetch_from_drive "${DRIVE_PREFIX}/latest/LATEST.json" "LATEST.json"
-
-  local bundle secrets
+  log "Fetching LATEST.json from Drive..."
+  fetch_drive "${DRIVE_PREFIX}/latest/LATEST.json" "LATEST.json"
   bundle=$(jq -r '.bundle' LATEST.json)
   secrets=$(jq -r '.secrets' LATEST.json)
 
-  if [ -z "$bundle" ] || [ "$bundle" = "null" ]; then
-    echo "LATEST.json missing .bundle" >&2; exit 2
-  fi
-  if [ -z "$secrets" ] || [ "$secrets" = "null" ]; then
-    echo "LATEST.json missing .secrets" >&2; exit 2
-  fi
+  log "Downloading secrets: $secrets"
+  fetch_drive "${DRIVE_PREFIX}/latest/${secrets}" "$secrets"
 
-  log "Downloading secrets bundle: $secrets"
-  fetch_from_drive "${DRIVE_PREFIX}/latest/${secrets}" "${secrets}"
+  log "Downloading bundle: $bundle"
+  fetch_drive "${DRIVE_PREFIX}/latest/${bundle}" "$bundle"
 
-  log "Downloading system bundle: $bundle"
-  fetch_from_drive "${DRIVE_PREFIX}/latest/${bundle}" "${bundle}"
+  log "Decrypting secrets (enter passphrase)..."
+  rm -rf secrets && mkdir -p secrets
+  gpg --batch --yes --decrypt "$secrets" | tar -C secrets -xf -
 
-  log "Decrypting secrets (will prompt for passphrase)..."
-  mkdir -p secrets
-  gpg --batch --yes --decrypt "${secrets}" | tar -C secrets -xf -
-
-  # secrets layout expectation:
-  # secrets/rclone/rclone.conf
-  # secrets/chatbot-hub-refactor/.env
-  # secrets/openclaw/openclaw.json
-  # secrets/cloudflared/config.yml (+ credentials if needed)
-
-  log "Installing rclone config from secrets..."
+  log "Installing rclone config from secrets"
   mkdir -p /root/.config/rclone
-  if [ -f secrets/rclone/rclone.conf ]; then
-    cp -f secrets/rclone/rclone.conf /root/.config/rclone/rclone.conf
-  else
-    echo "Missing secrets/rclone/rclone.conf" >&2; exit 3
+  cp -f secrets/rclone/rclone.conf /root/.config/rclone/rclone.conf
+
+  log "Extracting bundle"
+  rm -rf bundle && mkdir -p bundle
+  tar --use-compress-program=unzstd -C bundle -xf "$bundle"
+
+  # Restore data
+  restore_postgres "bundle/postgres.dump"
+  restore_qdrant "bundle/qdrant"
+
+  log "Restore configs (OpenClaw/cloudflared) - manual finalize may be needed"
+  # OpenClaw config
+  if [ -f secrets/openclaw/openclaw.json ]; then
+    install -d -m 700 /root/.openclaw
+    cp -f secrets/openclaw/openclaw.json /root/.openclaw/openclaw.json
   fi
 
-  log "Extracting system bundle..."
-  mkdir -p bundle
-  tar --use-compress-program=unzstd -C bundle -xf "${bundle}"
-
-  log "Next steps (placeholder): restore services and data."
-  echo "OK: downloaded and unpacked bundle + secrets into $WORKDIR"
-  echo "TODO: implement restore of Postgres/Qdrant/Redis/OpenClaw/chatbot services"
+  log "Done."
+  log "Next: restore cloudflared + OpenClaw gateway + chatbot services (WIP)"
 }
 
 main "$@"
