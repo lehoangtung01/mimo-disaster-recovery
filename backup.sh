@@ -43,6 +43,7 @@ main(){
   require_cmd pg_dump
   require_cmd curl
   require_cmd jq
+  require_cmd rsync
 
   mkdir -p "$WORKDIR" "$OUTDIR"
   rm -rf "$WORKDIR"/*
@@ -84,8 +85,23 @@ main(){
   pm2 save --force >/dev/null 2>&1 || true
   cp -a "$HOME/.pm2/dump.pm2" "$WORKDIR/config/pm2/dump.pm2" 2>/dev/null || true
 
-  # chatbot env (if you want to keep it in secrets instead, remove this line)
+  # chatbot env
   cp -a "/home/hoangtung/Documents/chatbot-hub-refactor/.env" "$WORKDIR/config/chatbot/chatbot-hub-refactor.env" 2>/dev/null || true
+
+  # chatbot source snapshot (exclude node_modules, logs, tmp)
+  if [ -d "/home/hoangtung/Documents/chatbot-hub-refactor" ]; then
+    log "Snapshot chatbot-hub-refactor source (no node_modules)"
+    mkdir -p "$WORKDIR/config/chatbot/chatbot-hub-refactor-src"
+    rsync -a --delete \
+      --exclude node_modules \
+      --exclude .git \
+      --exclude logs \
+      --exclude tmp \
+      --exclude .next \
+      --exclude dist \
+      /home/hoangtung/Documents/chatbot-hub-refactor/ \
+      "$WORKDIR/config/chatbot/chatbot-hub-refactor-src/" || true
+  fi
 
   log "Build bundle: $BUNDLE_NAME"
   tar -C "$WORKDIR" -cf - . | zstd -19 -T0 -o "$OUTDIR/$BUNDLE_NAME"
