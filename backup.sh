@@ -32,9 +32,9 @@ main(){
   rm -rf "$WORKDIR"/*
 
   log "Dumping Postgres (custom format)..."
-  # Prefer peer/local socket. Use sudo -u postgres to avoid password prompts.
+  # Dump as postgres to stdout, write file as current user/root to avoid permission issues.
   if id postgres >/dev/null 2>&1; then
-    sudo -n -u postgres pg_dump -Fc -f "$WORKDIR/postgres.dump" postgres || sudo -u postgres pg_dump -Fc -f "$WORKDIR/postgres.dump" postgres
+    sudo -n -u postgres pg_dump -Fc postgres > "$WORKDIR/postgres.dump" || sudo -u postgres pg_dump -Fc postgres > "$WORKDIR/postgres.dump"
   else
     echo "postgres user not found; set PGPASSWORD/PG* env and re-run" >&2
     exit 2
